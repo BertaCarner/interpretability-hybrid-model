@@ -1,10 +1,10 @@
 """Hybrid Mamba-Transformer architecture for mechanistic interpretability.
 
-Layer layout (4 layers, interleaved):
-  L0: SimpleMambaBlock   (SSM with explicit sequential scan)
-  L1: StandardAttentionBlock
-  L2: SimpleMambaBlock
-  L3: StandardAttentionBlock
+Layer layout is set by HybridConfig.layer_pattern, a string of 'M'
+(SimpleMambaBlock, SSM with explicit sequential scan) and 'A'
+(StandardAttentionBlock), e.g. "MAMA", "AMAM", "MMMM", "AAAA". The two block
+types are identical in every architecture, so differences between
+architectures come only from which block sits where.
 
 Design constraints (from project spec):
   - SimpleMambaBlock uses an explicit Python for-loop over time steps so that
@@ -36,6 +36,7 @@ Cache keys returned by run_with_cache():
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -58,20 +59,31 @@ class HybridConfig:
     expand: int = 2         # Mamba inner-dim multiplier
     dt_rank: int = 0        # 0 → auto: max(1, d_model // 16)
     n_heads: int = 4        # attention heads
+    mlp_ratio: int = 2      # attention MLP width = mlp_ratio * d_model. 2 keeps
+                            # an attention block (~132k params at d_model=128)
+                            # close to a Mamba block (~117k).
 
     # Architecture pattern: string of 'M' (Mamba) / 'A' (Attention).
     # None → default alternating "MA" repeated (backwards compatible).
     # Examples: "MAMA", "AMAM", "MMMM", "AAAA".
     layer_pattern: Optional[str] = None
 
-    # Learned absolute positional embeddings. Needed for pure-attention
-    # models (a NoPE 4-layer attn model struggles to form a previous-token
-    # head on this task). Mamba-containing models get position implicitly
-    # from the depthwise conv / recurrence, so default is False.
-    # CAVEAT: with use_pos_emb=True the model cannot be evaluated beyond
-    # max_seq_len, and positions never seen in training are untrained.
-    use_pos_emb: bool = False
-    max_seq_len: int = 512
+    # Position information for the attention layers:
+    #   'rope'    — rotary embeddings on Q/K inside every attention layer.
+    #               Default: every architecture then uses the *same* attention
+    #               block, and relative positions carry over to longer
+    #               sequences.
+    #   'learned' — learned absolute embeddings added to the token embedding.
+    #               CAVEAT: cannot be evaluated beyond max_seq_len, and
+    #               positions never seen in training are untrained.
+    #   'none'    — no explicit position signal (attention only gets what the
+    #               causal mask and any earlier Mamba layer leak).
+    pos_encoding: str = "rope"
+    # Bias on the Q/K projections. With RoPE it gives every query and key a
+    # token-independent component, which is what a purely position-based
+    # attention pattern (e.g. 'attend to the previous token') is built from.
+    qk_bias: bool = True
+    max_seq_len: int = 512  # only used by pos_encoding='learned'
 
     def __post_init__(self):
         if self.layer_pattern is None:
@@ -81,6 +93,9 @@ class HybridConfig:
         assert set(self.layer_pattern) <= {"M", "A"}, "layer_pattern must contain only 'M'/'A'"
         self.n_layers = len(self.layer_pattern)
         assert self.d_model % self.n_heads == 0
+        assert self.pos_encoding in ("rope", "learned", "none")
+        if self.pos_encoding == "rope":
+            assert (self.d_model // self.n_heads) % 2 == 0, "RoPE needs an even d_head"
         if self.dt_rank == 0:
             self.dt_rank = max(1, self.d_model // 16)
 
@@ -124,6 +139,13 @@ class SimpleMambaBlock(nn.Module):
         self.d_inner = Di
         self.d_state = N
         self.dt_rank = R
+
+        # Pathway ablations (see mamba_ablation). A Mamba block can move
+        # information across positions in exactly two ways:
+        #   memory — the recurrent state h_{t-1} → h_t
+        #   conv   — the depthwise conv, which sees the previous d_conv-1 tokens
+        self.ablate_memory = False   # True → h_t forgets h_{t-1} (Ā = 0)
+        self.ablate_conv = False     # True → conv keeps only the current token
 
         self.norm = nn.LayerNorm(D)
 
@@ -193,6 +215,8 @@ class SimpleMambaBlock(nn.Module):
         dA = torch.exp(torch.einsum("bld,dn->bldn", delta, A))   # (B, L, Di, N)
         # dB[b,t,d,n] = delta[b,t,d] * B_t[b,t,n]  (Euler approx)
         dB = torch.einsum("bld,bln->bldn", delta, B_t)            # (B, L, Di, N)
+        if self.ablate_memory:
+            dA = torch.zeros_like(dA)     # h_t = dB_t ⊙ x_t: nothing carried over
 
         h = x_act.new_zeros(B, Di, N)                             # (B, Di, N)
         h_list: list[torch.Tensor] = []
@@ -235,9 +259,17 @@ class SimpleMambaBlock(nn.Module):
         xz = self.in_proj(x_n)                    # (B, L, 2·Di)
         x_ssm, z = xz.chunk(2, dim=-1)            # each (B, L, Di)
 
-        # Causal depthwise conv (trim right-padding)
-        x_conv = self.conv1d(
-            x_ssm.transpose(1, 2)                 # (B, Di, L)
+        # Causal depthwise conv (trim right-padding). With padding d_conv-1,
+        # the LAST kernel tap multiplies the current token and the earlier
+        # taps multiply the previous d_conv-1 tokens.
+        conv_w = self.conv1d.weight                # (Di, 1, d_conv)
+        if self.ablate_conv:
+            conv_w = conv_w.clone()
+            conv_w[..., :-1] = 0.0                 # drop the previous-token taps
+        x_conv = F.conv1d(
+            x_ssm.transpose(1, 2),                 # (B, Di, L)
+            conv_w, self.conv1d.bias,
+            padding=self.conv1d.padding[0], groups=self.d_inner,
         )[:, :, :L].transpose(1, 2)               # (B, L, Di)
         x_act = F.silu(x_conv)                    # (B, L, Di)
 
@@ -280,13 +312,17 @@ class StandardAttentionBlock(nn.Module):
     Standard pre-norm causal multi-head attention + MLP block.
 
     K and V tensors are explicitly separated and can be overridden per-position
-    to support cross-architecture activation patching.
+    to support cross-architecture activation patching. K is cached and
+    overridden *before* the rotary rotation, which is a fixed function of
+    position, so splicing K at a position keeps that position's rotation.
 
     Args (forward):
-        x          : (B, L, D)
-        K_override : (B, L, H, d_h)  — clean K to splice in
-        V_override : (B, L, H, d_h)  — clean V to splice in
-        KV_mask    : (L,) bool        — which positions to override K/V
+        x                 : (B, L, D)
+        K_override        : (B, L, H, d_h)  — clean K to splice in
+        V_override        : (B, L, H, d_h)  — clean V to splice in
+        KV_mask           : (L,) bool        — which positions to override K/V
+        attn_out_override : (B, L, D)        — clean attention output
+        attn_out_mask     : (L,) bool        — which positions to override it
     """
 
     def __init__(self, config: HybridConfig):
@@ -298,17 +334,18 @@ class StandardAttentionBlock(nn.Module):
         self.n_heads = H
         self.d_head = d_h
         self.scale = d_h ** -0.5
+        self.use_rope = config.pos_encoding == "rope"
 
         # Attention sublayer
         self.norm1 = nn.LayerNorm(D)
-        self.q_proj = nn.Linear(D, D, bias=False)    # (D, D)
-        self.k_proj = nn.Linear(D, D, bias=False)    # (D, D)
+        self.q_proj = nn.Linear(D, D, bias=config.qk_bias)    # (D, D)
+        self.k_proj = nn.Linear(D, D, bias=config.qk_bias)    # (D, D)
         self.v_proj = nn.Linear(D, D, bias=False)    # (D, D)
         self.out_proj = nn.Linear(D, D, bias=False)  # (D, D)
 
         # MLP sublayer
         self.norm2 = nn.LayerNorm(D)
-        d_ff = 4 * D
+        d_ff = config.mlp_ratio * D
         self.mlp = nn.Sequential(
             nn.Linear(D, d_ff, bias=False),
             nn.GELU(),
@@ -321,6 +358,8 @@ class StandardAttentionBlock(nn.Module):
         K_override: Optional[torch.Tensor] = None,   # (B, L, H, d_h)
         V_override: Optional[torch.Tensor] = None,   # (B, L, H, d_h)
         KV_mask: Optional[torch.Tensor] = None,      # (L,) bool
+        attn_out_override: Optional[torch.Tensor] = None,   # (B, L, D)
+        attn_out_mask: Optional[torch.Tensor] = None,       # (L,) bool
     ) -> tuple[torch.Tensor, dict]:
 
         B, L, D = x.shape
@@ -348,6 +387,8 @@ class StandardAttentionBlock(nn.Module):
         Q_t = Q.permute(0, 2, 1, 3)                  # (B, H, L, d_h)
         K_t = K.permute(0, 2, 1, 3)                  # (B, H, L, d_h)
         V_t = V.permute(0, 2, 1, 3)                  # (B, H, L, d_h)
+        if self.use_rope:
+            Q_t, K_t = self._rope(Q_t), self._rope(K_t)
 
         scores = (Q_t @ K_t.transpose(-2, -1)) * self.scale  # (B, H, L, L)
         causal_mask = torch.triu(
@@ -360,6 +401,13 @@ class StandardAttentionBlock(nn.Module):
         attn_vals = attn_w @ V_t                      # (B, H, L, d_h)
         attn_concat = attn_vals.permute(0, 2, 1, 3).reshape(B, L, D)  # (B, L, D)
         attn_out = self.out_proj(attn_concat)         # (B, L, D)
+
+        # Splice in the clean attention output *before* the residual add, so
+        # this block's MLP also sees the patched value.
+        if attn_out_override is not None and attn_out_mask is not None:
+            attn_out = attn_out.clone()
+            attn_out[:, attn_out_mask] = attn_out_override[:, attn_out_mask]
+
         x = residual_attn + attn_out                  # (B, L, D)
 
         # --- MLP sublayer ---
@@ -372,11 +420,26 @@ class StandardAttentionBlock(nn.Module):
             "K":        K,          # (B, L, H, d_h)  — post-override
             "V":        V,          # (B, L, H, d_h)  — post-override
             "attn_w":   attn_w,     # (B, H, L, L)
-            "attn_out": attn_out,   # (B, L, D)
+            "attn_out": attn_out,   # (B, L, D)   — post-override
             "mlp_out":  mlp_out,    # (B, L, D)
             "resid_out": out,       # (B, L, D)
         }
         return out, cache
+
+    @staticmethod
+    def _rope(x: torch.Tensor) -> torch.Tensor:
+        """Rotary position embedding: rotate each (even, odd) pair of the head
+        dimension by an angle proportional to the position. x: (B, H, L, d_h)."""
+        L, d_h = x.shape[-2], x.shape[-1]
+        inv_freq = 1.0 / (10000 ** (
+            torch.arange(0, d_h, 2, device=x.device, dtype=x.dtype) / d_h
+        ))                                             # (d_h/2,)
+        ang = torch.arange(L, device=x.device, dtype=x.dtype)[:, None] * inv_freq
+        cos, sin = ang.cos(), ang.sin()                # (L, d_h/2)
+        x1, x2 = x[..., 0::2], x[..., 1::2]            # (B, H, L, d_h/2)
+        return torch.stack(
+            [x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1
+        ).flatten(-2)                                  # (B, H, L, d_h)
 
 
 # ---------------------------------------------------------------------------
@@ -385,11 +448,9 @@ class StandardAttentionBlock(nn.Module):
 
 class HybridLM(nn.Module):
     """
-    4-layer interleaved Mamba-Transformer LM.
+    Mamba / attention LM with the layer order given by config.layer_pattern.
 
-    Layer order: Mamba → Attn → Mamba → Attn
-
-    Central hypothesis under test: Mamba (L0) compresses the [A, B] bigram
+    Central hypothesis under test (for the "MAMA" hybrid): Mamba (L0) compresses the [A, B] bigram
     into h_t and writes it to the residual stream; the subsequent Attention
     (L1) reads this out via its K/V projections, implementing a
     cross-architecture induction circuit.
@@ -402,7 +463,7 @@ class HybridLM(nn.Module):
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_emb = (
             nn.Embedding(config.max_seq_len, config.d_model)
-            if config.use_pos_emb else None
+            if config.pos_encoding == "learned" else None
         )
 
         self.layers = nn.ModuleList()
@@ -440,7 +501,7 @@ class HybridLM(nn.Module):
             L = input_ids.shape[1]
             assert L <= self.config.max_seq_len, (
                 f"seq_len {L} exceeds max_seq_len {self.config.max_seq_len} "
-                "(use_pos_emb=True model cannot extrapolate)"
+                "(pos_encoding='learned' model cannot extrapolate)"
             )
             pos = torch.arange(L, device=input_ids.device)
             x = x + self.pos_emb(pos)[None]    # (B, L, D)
@@ -483,3 +544,36 @@ class HybridLM(nn.Module):
                 A = -torch.exp(layer.A_log.detach())   # (Di, N)
                 result.append((i, A))
         return result
+
+
+# ---------------------------------------------------------------------------
+# Pathway ablation
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def mamba_ablation(
+    model: HybridLM,
+    layers: Optional[list[int]] = None,   # Mamba layer indices; None → all
+    memory: bool = False,
+    conv: bool = False,
+):
+    """
+    Temporarily switch off cross-position pathways in the given Mamba layers.
+
+      memory=True → the SSM state is not carried between positions
+      conv=True   → the depthwise conv sees only the current token
+
+    With both on, the block is a purely per-token function (like an MLP), so
+    it cannot move any information between positions.
+    """
+    blocks = [
+        layer for i, layer in enumerate(model.layers)
+        if isinstance(layer, SimpleMambaBlock) and (layers is None or i in layers)
+    ]
+    for b in blocks:
+        b.ablate_memory, b.ablate_conv = memory, conv
+    try:
+        yield model
+    finally:
+        for b in blocks:
+            b.ablate_memory, b.ablate_conv = False, False

@@ -55,7 +55,7 @@ def main():
     cfg = default_hybrid_config(vocab_size=args.vocab_size,
                                 layer_pattern=ARCHS[args.arch])
     model = HybridLM(cfg)
-    ckpt = args.ckpt or f"results/checkpoints/{args.arch}_{args.seed_tag}_best.pt"
+    ckpt = args.ckpt or f"results/checkpoints/{args.arch}_{args.seed_tag}_final.pt"
     model.load_state_dict(torch.load(ckpt, map_location="cpu"))
     model.to(device).eval()
     print(f"Loaded {ckpt} | device {device}\n")
