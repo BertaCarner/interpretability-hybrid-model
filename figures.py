@@ -1,22 +1,22 @@
-"""Publication-ready figures for the Hybrid Mamba-Transformer interpretability paper.
+"""Figures for the Hybrid Mamba-Transformer interpretability project.
 
-Figure 1 (figure_patching_heatmap.png):
-    Cross-architecture activation patching heatmap.
-    Sub-panels per component (h, K, V, attn_out).
-    Layer types annotated; Mamba rows show h recovery, Attn rows show K/V recovery.
-    Vertical markers for first_A_pos, first_B_pos, second_A_pos.
+Per seed (figures/<seed_tag>/):
+    figure_patching_heatmap_<arch>.png  Q1  patching, every position, both corruptions
+    figure_arch_comparison.png          Q1  where each half of the circuit lives, per arch
+    figure_formation_<arch>.png         Q2  behaviour and patching effect over training
+    figure_distance.png                 Q3  recall vs distance, with / without SSM memory
+    figure_pathway_ablation.png             SSM memory vs conv, per Mamba layer
+    figure_probe_decoding.png               is B decodable from the SSM state?
+    figure_ablation.png                     state-dim ablation vs random-dims control
+    figure_timescales_<arch>.png            SSM memory timescales vs initialisation
+    figure_phase_transition_<run>.png       written by train.py
 
-Figure 2 (figure_phase_transition.png):
-    Generated directly by train.py. Loss + accuracy + logit-diff curves.
+Across seeds (figures/):
+    figure_seeds_training.png           validation accuracy vs step, one line per seed
 
-Figure 3 (figure_eigenspectrum.png):
-    SSM A-matrix memory timescales per Mamba layer.
-
-Figure 4 (figure_probe_auroc.png):
-    Linear probe AUROC on h_t state dimensions.
-
-Figure 5 (figure_ablation.png):
-    Accuracy drop when top state dimensions are ablated.
+Conventions: one y-axis per panel; colour follows the entity (component,
+architecture, ablation condition) and is the same in every figure; every
+series also differs by marker or line style, so nothing relies on colour alone.
 """
 
 from __future__ import annotations
@@ -28,470 +28,672 @@ from typing import Optional
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import matplotlib.ticker
+from matplotlib.colors import LinearSegmentedColormap
+
+# ── Ink, surfaces, palette ──────────────────────────────────────────────────
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_2 = "#52514e"
+MUTED = "#898781"
+GRID = "#e1e0d9"
+AXIS = "#c3c2b7"
 
 matplotlib.rcParams.update({
-    "font.family": "serif",
-    "font.size": 11,
-    "axes.labelsize": 12,
-    "axes.titlesize": 12,
-    "legend.fontsize": 10,
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Segoe UI", "DejaVu Sans", "Arial"],
+    "font.size": 10,
+    "axes.labelsize": 10,
+    "axes.titlesize": 10.5,
+    "axes.titleweight": "bold",
+    "axes.titlelocation": "left",
+    "legend.fontsize": 8.5,
+    "legend.frameon": False,
     "figure.dpi": 150,
+    "figure.facecolor": SURFACE,
+    "axes.facecolor": SURFACE,
+    "savefig.facecolor": SURFACE,
+    "text.color": INK,
+    "axes.labelcolor": INK_2,
+    "axes.edgecolor": AXIS,
+    "xtick.color": MUTED,
+    "ytick.color": MUTED,
+    "xtick.labelcolor": INK_2,
+    "ytick.labelcolor": INK_2,
     "axes.spines.top": False,
     "axes.spines.right": False,
+    "axes.grid": True,
+    "axes.axisbelow": True,
+    "grid.color": GRID,
+    "grid.linewidth": 0.6,
+    "lines.linewidth": 2.0,
+    "lines.markersize": 5,
 })
 
-# Colours per component
-COMP_COLOR = {
-    "h":        "#1a9641",
-    "K":        "#2166ac",
-    "V":        "#756bb1",
-    "attn_out": "#d6604d",
+# Fixed categorical slots (validated order): blue, orange, aqua, yellow, magenta
+SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+
+COMP_ORDER = ["resid", "h", "K", "V", "attn_out"]
+COMP_COLOR = dict(zip(COMP_ORDER, SLOTS))
+
+ARCH_ORDER = ["hybrid_ma", "hybrid_am", "mamba", "attn"]
+ARCH_COLOR = dict(zip(ARCH_ORDER, SLOTS))
+ARCH_MARKER = {"hybrid_ma": "o", "hybrid_am": "s", "mamba": "^", "attn": "D"}
+ARCH_LABEL = {
+    "hybrid_ma": "MAMA (hybrid, Mamba first)",
+    "hybrid_am": "AMAM (hybrid, attention first)",
+    "mamba":     "MMMM (pure Mamba)",
+    "attn":      "AAAA (pure attention)",
 }
 
-LAYER_HATCH = {
-    "mamba": "",
-    "attn":  "//",
+PATHWAY_ORDER = ["intact", "no_memory", "no_conv", "no_memory_no_conv"]
+PATHWAY_COLOR = dict(zip(PATHWAY_ORDER, [MUTED] + SLOTS[:3]))
+PATHWAY_LABEL = {
+    "intact": "intact",
+    "no_memory": "SSM memory off",
+    "no_conv": "conv off",
+    "no_memory_no_conv": "both off",
 }
+
+LINE_STYLES = ["-", "--", ":", "-."]
+MARKERS = ["o", "s", "^", "D", "v", "P"]
+
+# Diverging: red (patch makes it worse) ← neutral gray (no effect) → blue (recovers)
+RECOVERY_CMAP = LinearSegmentedColormap.from_list(
+    "recovery", ["#9c2424", "#e34948", "#f0efec", "#3987e5", "#104281"]
+)
+RECOVERY_CMAP.set_bad(SURFACE)
+
+CORRUPTION_TITLE = {
+    "B": "Corrupt B → which path carries the answer?",
+    "A": "Corrupt A₁ → which path does the matching?",
+}
+POS_LABEL = {"first_A": "A₁", "first_B": "B", "second_A": "A₂"}
+
+
+def _arch_label(arch: str) -> str:
+    return ARCH_LABEL.get(arch, arch)
+
+
+def _sorted_archs(archs) -> list[str]:
+    known = [a for a in ARCH_ORDER if a in archs]
+    return known + sorted(a for a in archs if a not in ARCH_ORDER)
+
+
+def _layer_tag(li: int, ltype: str) -> str:
+    return f"L{li} {'Mamba' if ltype == 'mamba' else 'attn'}"
+
+
+def _mechanism_rows(layer_types: list[str], with_resid: bool) -> list[tuple[int, str]]:
+    """(layer, component) rows from the bottom of the network up."""
+    rows = []
+    for li, lt in enumerate(layer_types):
+        comps = ["h"] if lt == "mamba" else ["K", "V", "attn_out"]
+        if with_resid:
+            comps.append("resid")
+        rows += [(li, c) for c in comps]
+    return rows
+
+
+def _pos_name(pos: int, first_A: int, seq_len: int) -> str:
+    """Human name for a sequence position relative to the bigram."""
+    if pos == first_A:
+        return "A₁"
+    if pos == first_A + 1:
+        return "B"
+    if pos == seq_len - 1:
+        return "A₂"
+    if first_A + 1 < pos <= first_A + 6:
+        return f"B+{pos - first_A - 1}"
+    return f"pos {pos}"
+
+
+def _save(fig: plt.Figure, save_path: Optional[str]) -> None:
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
 
 
 # ---------------------------------------------------------------------------
-# Figure 1: Cross-architecture patching heatmap
+# Q1: patching heatmap — every position, both corruptions
 # ---------------------------------------------------------------------------
 
 def plot_patching_heatmap(
-    grids: dict[str, np.ndarray],       # component → (n_layers, seq_len)
-    layer_types: list[str],             # 'mamba' or 'attn' per layer
-    first_A_pos: Optional[int] = None,
-    first_B_pos: Optional[int] = None,
-    second_A_pos: Optional[int] = None,
+    pgs: dict[str, "object"],           # corruption → PatchGrid
+    arch: str,
+    first_A_pos: int,
     save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
-    One sub-panel per component.  Mamba/Attn rows are annotated with band colours.
-    Black vertical lines mark the critical sequence positions.
+    One panel per corruption. Rows are the patchable (layer, component)
+    pairs from the bottom of the network up; columns are sequence positions.
+    A blue cell means: copying that one activation from the clean run into
+    the corrupted run restores the clean answer.
     """
-    components = list(grids.keys())
-    n_layers, seq_len = next(iter(grids.values())).shape
-    n_cols = len(components)
+    corruptions = list(pgs.keys())
+    any_pg = pgs[corruptions[0]]
+    rows = _mechanism_rows(any_pg.layer_types, with_resid=True)
+    L = any_pg.seq_len
 
-    fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 3.8), squeeze=False)
+    fig, axes = plt.subplots(
+        1, len(corruptions), figsize=(6.4 * len(corruptions), 0.34 * len(rows) + 2.2),
+        sharey=True, squeeze=False, constrained_layout=True,
+    )
     axes = axes[0]
 
-    for ax, comp in zip(axes, components):
-        g = np.array(grids[comp], dtype=float)
-        g_masked = np.ma.masked_invalid(g)   # NaN = not evaluated (wrong layer type)
-        cmap = matplotlib.colormaps["RdYlGn"].copy()
-        cmap.set_bad("#e0e0e0")
-
+    im = None
+    for ax, corr in zip(axes, corruptions):
+        pg = pgs[corr]
+        M = np.array([np.asarray(pg.grids[c], dtype=float)[li] for li, c in rows])
         im = ax.imshow(
-            g_masked, aspect="auto", vmin=0, vmax=1,
-            cmap=cmap, origin="lower",
-            extent=[-0.5, seq_len - 0.5, -0.5, n_layers - 0.5],
+            np.ma.masked_invalid(M), aspect="auto", vmin=-1, vmax=1,
+            cmap=RECOVERY_CMAP, origin="lower", interpolation="nearest",
+            extent=[-0.5, L - 0.5, -0.5, len(rows) - 0.5],
         )
+        ax.grid(False)
+        # Surface-coloured gaps between layers
+        for r in range(1, len(rows)):
+            if rows[r][0] != rows[r - 1][0]:
+                ax.axhline(r - 0.5, color=SURFACE, lw=3)
 
-        # Shade rows by layer type
-        for li, ltype in enumerate(layer_types):
-            color = "#d1e5f0" if ltype == "mamba" else "#fee0d2"
-            ax.axhspan(li - 0.5, li + 0.5, color=color, alpha=0.20, zorder=0)
-
-        # Mark critical positions
-        for pos, ls, label in [
-            (first_A_pos,  ":",  "A₁"),
-            (first_B_pos,  "--", "B"),
-            (second_A_pos, "-",  "A₂"),
-        ]:
-            if pos is not None:
-                ax.axvline(pos, color="black", lw=1.4, ls=ls, alpha=0.85)
-                ax.text(pos + 0.3, n_layers - 0.4, label,
-                        fontsize=8, color="black", va="top")
-
-        ax.set_title(f"Component: {comp}", pad=6,
-                     color=COMP_COLOR.get(comp, "black"), fontweight="bold")
-        ax.set_xlabel("Sequence position")
-        ax.set_ylabel("Layer" if comp == components[0] else "")
-        ax.set_yticks(range(n_layers))
+        ax.set_yticks(range(len(rows)))
         ax.set_yticklabels(
-            [f"L{i} ({t[0].upper()})" for i, t in enumerate(layer_types)]
+            [f"{_layer_tag(li, any_pg.layer_types[li])} · {c}" for li, c in rows]
         )
+        ax.set_xlabel("Sequence position of the patch")
 
-    # Shared colorbar
-    cbar = fig.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04)
-    cbar.set_label("Recovery fraction (LD patched − LD corrupted) / (LD clean − LD corrupted)")
+        # Name the three critical positions on the top edge
+        top = ax.secondary_xaxis("top")
+        top.set_xticks([first_A_pos, first_A_pos + 1, L - 1])
+        top.set_xticklabels(["A₁", "B", "A₂"])
+        top.tick_params(length=4, color=INK_2, labelcolor=INK)
+        top.spines["top"].set_visible(False)
+        # A₁ and B are adjacent columns: push their labels apart
+        lab_A, lab_B, _ = top.get_xticklabels()
+        lab_A.set_ha("right")
+        lab_B.set_ha("left")
 
-    # Legend for layer types
-    patches = [
-        mpatches.Patch(facecolor="#d1e5f0", alpha=0.5, label="Mamba layer"),
-        mpatches.Patch(facecolor="#fee0d2", alpha=0.5, label="Attention layer"),
-    ]
-    fig.legend(handles=patches, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02))
+        note = (f"logit diff: clean {pg.clean_ld:+.1f}, "
+                f"corrupted {pg.corrupted_ld:+.1f}")
+        if not pg.reliable:
+            note += "  — gap too small, do NOT interpret"
+        ax.set_title(CORRUPTION_TITLE.get(corr, corr), pad=38)
+        ax.annotate(note, xy=(0, 1), xycoords="axes fraction", xytext=(0, 24),
+                    textcoords="offset points", fontsize=8.5, color=INK_2)
 
-    fig.suptitle(
-        "Cross-Architecture Activation Patching: Logit-Difference Recovery\n"
-        "Hybrid Mamba-Transformer (L0:Mamba → L1:Attn → L2:Mamba → L3:Attn)",
-        fontweight="bold", y=1.06,
-    )
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+    cbar = fig.colorbar(im, ax=list(axes), fraction=0.025, pad=0.02)
+    cbar.set_label("Recovery (1 = patch fully restores the clean answer)")
+    cbar.outline.set_visible(False)
+    fig.suptitle(f"{_arch_label(arch)} — activation patching, one position at a time",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Figure 3: A-matrix eigenspectrum
-# ---------------------------------------------------------------------------
-
-def plot_eigenspectrum(
-    eigen_results: list,    # list of EigenResult-like objects
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    mamba_layers = [er for er in eigen_results]
-    n = len(mamba_layers)
-    if n == 0:
-        return plt.figure()
-
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.8), sharey=False)
-    if n == 1:
-        axes = [axes]
-
-    for ax, er in zip(axes, mamba_layers):
-        ts = np.array(er.decay_timescales)
-        max_display = 200
-        ts_clipped = np.where(np.isinf(ts), max_display, ts)
-        dims = np.arange(len(ts_clipped))
-
-        sc = ax.scatter(dims, ts_clipped, c=ts_clipped, cmap="plasma",
-                        s=60, vmin=0, vmax=max_display, zorder=3)
-        ax.axhline(1, color="gray", ls=":", lw=0.8)
-        ax.set_xlabel("State dimension (sorted by eigenvalue magnitude)")
-        ax.set_ylabel("Decay timescale τ (steps)" if er == mamba_layers[0] else "")
-        ax.set_title(f"Mamba Layer {er.layer}", fontweight="bold")
-        ax.set_ylim(-5, max_display + 15)
-
-    plt.colorbar(sc, ax=axes[-1], label="τ (steps)", fraction=0.046, pad=0.04)
-    fig.suptitle(
-        "SSM State Dimension Memory Timescales\n"
-        "(τ = −1/log|λ|; longer τ = longer memory)",
-        fontweight="bold",
-    )
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Figure 4: Probe AUROC heatmap
-# ---------------------------------------------------------------------------
-
-def plot_probe_decoding(
-    probe_results: list,     # ProbeResult-like: layer, position, accuracy, chance, per_dim_score
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    Left : decoding accuracy of B's identity vs read position, one line per
-           Mamba layer (positions before the bigram = negative control).
-    Right: per-dim F-score at the trigger position → which state dims carry B.
-    """
-    layers = sorted({pr.layer for pr in probe_results})
-    positions = sorted({pr.position for pr in probe_results})
-    chance = probe_results[0].chance if probe_results else 0.0
-    trigger_pos = max(positions)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 3.8))
-
-    colors = plt.cm.viridis(np.linspace(0.15, 0.8, max(len(layers), 2)))
-    for c, li in zip(colors, layers):
-        pts = sorted(
-            [(pr.position, pr.accuracy) for pr in probe_results if pr.layer == li]
-        )
-        ax1.plot([p for p, _ in pts], [a for _, a in pts],
-                 "o-", color=c, label=f"Mamba L{li}")
-    ax1.axhline(chance, color="gray", ls=":", lw=1, label=f"chance = {chance:.3f}")
-    ax1.set_xlabel("Read position of h_t")
-    ax1.set_ylabel("Decode accuracy of B (64-way)")
-    ax1.set_title("Is B's identity linearly decodable\nfrom the SSM state?")
-    ax1.legend(fontsize=8)
-    ax1.set_ylim(-0.03, 1.05)
-
-    width = 0.8 / max(len(layers), 1)
-    for k, (c, li) in enumerate(zip(colors, layers)):
-        pr = next((p for p in probe_results
-                   if p.layer == li and p.position == trigger_pos), None)
-        if pr is None:
-            continue
-        scores = np.array(pr.per_dim_score)
-        dims = np.arange(len(scores))
-        ax2.bar(dims + k * width, scores, width, color=c, label=f"L{li}")
-    ax2.set_xlabel("SSM state dimension")
-    ax2.set_ylabel("ANOVA F-score")
-    ax2.set_title(f"Which dims carry B at the trigger (pos {trigger_pos})?\n"
-                  "(top dims are the ablation targets)")
-    ax2.legend(fontsize=8)
-
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Figure: 4-architecture comparison (Q1)
+# Q1: cross-architecture summary
 # ---------------------------------------------------------------------------
 
 def plot_arch_comparison(
-    patch_grids: dict[str, "object"],     # arch label → PatchGrid
-    first_B_pos: int,                      # position of B in the fixed-distance set
+    arch_pgs: dict[str, dict[str, "object"]],   # arch → corruption → PatchGrid
+    first_A_pos: int,
     save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
-    For each architecture, the recovery per (layer, component) at the
-    first_B position — the single most informative slice: 'which layer, of
-    which type, carries the [A,B] binding forward?'
+    For each architecture, the best recovery over positions for every
+    mechanism component (h for Mamba layers; K, V, attn_out for attention
+    layers), under each corruption. Each cell also names the position where
+    that best recovery occurs. The residual stream is left out: patching it
+    late in the network recovers everything by construction.
     """
-    archs = list(patch_grids.keys())
-    fig, axes = plt.subplots(1, len(archs), figsize=(3.6 * len(archs), 3.6),
-                             sharey=True, squeeze=False)
+    archs = _sorted_archs(arch_pgs.keys())
+    n_rows_max = max(
+        len(_mechanism_rows(next(iter(arch_pgs[a].values())).layer_types, False))
+        for a in archs
+    )
+    fig, axes = plt.subplots(
+        1, len(archs), figsize=(3.3 * len(archs), 0.42 * n_rows_max + 2.0),
+        squeeze=False, constrained_layout=True,
+    )
     axes = axes[0]
 
+    im = None
     for ax, arch in zip(axes, archs):
-        pg = patch_grids[arch]
-        first_B = first_B_pos
-        n_layers = pg.n_layers
+        pgs = arch_pgs[arch]
+        corruptions = list(pgs.keys())
+        any_pg = pgs[corruptions[0]]
+        rows = _mechanism_rows(any_pg.layer_types, with_resid=False)
 
-        bottoms = np.arange(n_layers)
-        for comp, grid in pg.grids.items():
-            g = np.array(grid, dtype=float)
-            vals = g[:, first_B]
-            valid = ~np.isnan(vals)
-            if not valid.any():
-                continue
-            ax.barh(bottoms[valid], vals[valid], height=0.6,
-                    color=COMP_COLOR.get(comp, "gray"), alpha=0.85,
-                    label=comp)
-        ax.axvline(0, color="black", lw=0.8)
-        ax.set_yticks(range(n_layers))
-        ax.set_yticklabels([f"L{i} ({t[0].upper()})"
-                            for i, t in enumerate(pg.layer_types)])
-        ax.set_xlabel("Recovery @ first_B_pos")
-        ax.set_title(arch, fontweight="bold")
-        ax.set_xlim(-0.2, 1.05)
+        M = np.full((len(rows), len(corruptions)), np.nan)
+        where = [[None] * len(corruptions) for _ in rows]
+        for j, corr in enumerate(corruptions):
+            pg = pgs[corr]
+            for i, (li, c) in enumerate(rows):
+                vals = np.asarray(pg.grids[c], dtype=float)[li]
+                if pg.reliable and np.isfinite(vals).any():
+                    k = int(np.nanargmax(vals))
+                    M[i, j], where[i][j] = vals[k], k
 
-    handles = [mpatches.Patch(color=c, label=k) for k, c in COMP_COLOR.items()]
-    fig.legend(handles=handles, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 1.06))
-    fig.suptitle("Where does the [A,B] binding live? — per architecture",
-                 fontweight="bold", y=1.14)
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+        im = ax.imshow(np.ma.masked_invalid(M), aspect="auto", vmin=-1, vmax=1,
+                       cmap=RECOVERY_CMAP, origin="lower")
+        ax.grid(False)
+        for r in range(1, len(rows)):
+            if rows[r][0] != rows[r - 1][0]:
+                ax.axhline(r - 0.5, color=SURFACE, lw=3)
+        ax.axvline(0.5, color=SURFACE, lw=3)
+
+        for i in range(len(rows)):
+            for j in range(len(corruptions)):
+                if np.isnan(M[i, j]):
+                    ax.text(j, i, "n/a", ha="center", va="center",
+                            fontsize=8, color=MUTED)
+                elif abs(M[i, j]) >= 0.1:
+                    name = _pos_name(where[i][j], first_A_pos, any_pg.seq_len)
+                    ax.text(j, i, f"{M[i, j]:.2f} @ {name}", ha="center", va="center",
+                            fontsize=8, color="white" if abs(M[i, j]) > 0.55 else INK)
+
+        ax.set_xticks(range(len(corruptions)))
+        ax.set_xticklabels(
+            ["answer path\n(corrupt B)" if c == "B" else "matching path\n(corrupt A₁)"
+             for c in corruptions]
+        )
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels(
+            [f"{_layer_tag(li, any_pg.layer_types[li])} · {c}" for li, c in rows]
+        )
+        ax.tick_params(length=0)
+        ax.set_title(_arch_label(arch))
+
+    cbar = fig.colorbar(im, ax=list(axes), fraction=0.02, pad=0.02)
+    cbar.set_label("Best recovery over positions")
+    cbar.outline.set_visible(False)
+    fig.suptitle("Where does each half of the induction circuit live?  "
+                 "(value @ position of the best patch)",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Figure: circuit formation timeline (Q2)
+# Q2: circuit formation timeline
 # ---------------------------------------------------------------------------
 
 def plot_formation(
     formation: dict,          # output of run_formation_analysis
+    arch: Optional[str] = None,
     save_path: Optional[str] = None,
     top_k: int = 4,
 ) -> plt.Figure:
+    """
+    Top panel: validation accuracy over training (the behaviour).
+    One panel per corruption below it: the patching EFFECT in logit units
+    for the top_k mechanism components (ranked at the last checkpoint), with
+    the total effect of the corruption (clean − corrupted) as the ceiling.
+    A component 'has formed' when its line leaves zero and climbs towards
+    the ceiling.
+    """
     recs = formation["records"]
     steps = [r["step"] for r in recs]
-    accs = [r["val_acc"] for r in recs]
-
-    # Rank (comp, layer, keypos) traces by final recovery; plot top_k
-    last = recs[-1]["recovery"]
-    traces = []
-    for comp, layers in last.items():
-        for li, poss in layers.items():
-            for pname, v in poss.items():
-                if v is not None:
-                    traces.append((v, comp, li, pname))
-    traces = sorted(traces, reverse=True)[:top_k]
-
-    fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    ax2 = ax.twinx()
-    ax2.plot(steps, accs, color="black", lw=2.2, alpha=0.85, label="val accuracy")
-    ax2.set_ylabel("Validation accuracy", color="black")
-    ax2.set_ylim(-0.05, 1.05)
-
     ltypes = formation["layer_types"]
-    for _, comp, li, pname in traces:
-        ys = [r["recovery"][comp][li][pname] for r in recs]
-        ys = [np.nan if y is None else y for y in ys]
-        ax.plot(steps, ys, "o-", ms=3.5, lw=1.6,
-                color=COMP_COLOR.get(comp, "gray"),
-                alpha=0.9,
-                label=f"{comp} L{li}({ltypes[int(li)][0].upper()}) @ {pname}")
+    corruptions = list(recs[-1]["patch"].keys())
 
-    ax.set_xlabel("Training step")
-    ax.set_ylabel("Patching recovery")
-    ax.set_ylim(-0.15, 1.1)
-    ax.set_title(f"Circuit formation — {formation['run_name']}\n"
-                 "Does the mechanism (recovery) precede the behaviour (accuracy)?",
-                 fontweight="bold")
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="center right")
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+    fig, axes = plt.subplots(
+        1 + len(corruptions), 1, figsize=(8.2, 2.2 + 2.6 * len(corruptions)),
+        sharex=True, constrained_layout=True,
+        gridspec_kw={"height_ratios": [1] + [1.5] * len(corruptions)},
+    )
+
+    axes[0].plot(steps, [r["val_acc"] for r in recs], color=INK, lw=2)
+    axes[0].set_ylim(-0.05, 1.05)
+    axes[0].set_ylabel("Accuracy")
+    axes[0].set_title("Behaviour: recall accuracy at the trigger")
+
+    for ax, corr in zip(axes[1:], corruptions):
+        # Rank mechanism traces (no 'resid') by |effect| at the last checkpoint
+        last = recs[-1]["patch"][corr]["effect"]
+        traces = []
+        for comp, layers in last.items():
+            if comp == "resid":
+                continue
+            for li, poss in layers.items():
+                for pname, v in poss.items():
+                    if v is not None:
+                        traces.append((abs(v), comp, li, pname))
+        traces = sorted(traces, reverse=True)[:top_k]
+
+        ax.plot(steps, [r["patch"][corr]["total_effect"] for r in recs],
+                color=INK_2, lw=1.4, label="ceiling: clean − corrupted")
+        ax.axhline(0, color=AXIS, lw=0.8)
+        for k, (_, comp, li, pname) in enumerate(traces):
+            ys = [r["patch"][corr]["effect"][comp][li][pname] for r in recs]
+            ys = [np.nan if y is None else y for y in ys]
+            ax.plot(steps, ys, ls=LINE_STYLES[k % len(LINE_STYLES)],
+                    marker=MARKERS[k % len(MARKERS)], ms=4,
+                    markevery=max(len(steps) // 12, 1),
+                    color=COMP_COLOR.get(comp, MUTED),
+                    label=f"{comp} in {_layer_tag(int(li), ltypes[int(li)])}, "
+                          f"patched at {POS_LABEL.get(pname, pname)}")
+        ax.set_ylabel("Effect of patch (logits)")
+        ax.set_title(CORRUPTION_TITLE.get(corr, corr))
+        ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
+
+    axes[-1].set_xlabel("Training step")
+    fig.suptitle(f"{_arch_label(arch) if arch else formation['run_name']} — "
+                 "when does each part of the circuit form?",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Figure: distance sweep + eigenspectrum prediction (Q3)
+# Q3: distance sweep
 # ---------------------------------------------------------------------------
 
 def plot_distance(
-    sweeps: dict[str, dict],       # arch label → run_distance_sweep output
+    sweeps: dict[str, dict],       # arch → run_distance_sweep output
     save_path: Optional[str] = None,
 ) -> plt.Figure:
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.2))
+    """
+    Left  : recall accuracy vs induction distance.
+    Middle: the same with the SSM memory switched off in every Mamba layer —
+            a model whose line does not move does not use the state to recall.
+    Right : how strongly the state handed to the trigger depends on B.
+    Hollow markers = sequence longer than anything seen in training.
+    """
+    archs = _sorted_archs(sweeps.keys())
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(14.5, 4.0),
+                                        constrained_layout=True)
 
-    colors = plt.cm.tab10(np.linspace(0, 0.5, max(len(sweeps), 2)))
-    chance = None
-    for c, (arch, sw) in zip(colors, sweeps.items()):
-        recs = sw["records"]
-        ds = [r["distance"] for r in recs]
-        accs = [r["accuracy"] for r in recs]
-        ax1.plot(ds, accs, "o-", color=c, lw=1.8, label=arch)
-        # mark out-of-distribution points
-        ood = [(r["distance"], r["accuracy"]) for r in recs if not r["in_distribution"]]
-        if ood:
-            ax1.scatter([d for d, _ in ood], [a for _, a in ood],
-                        facecolors="none", edgecolors=c, s=110, lw=1.6, zorder=5)
-        if sw.get("trained_seq_len"):
-            ax1.axvline(sw["trained_seq_len"], color="gray", ls="--", lw=0.9, alpha=0.5)
-        chance = sw.get("chance_accuracy", chance)
-
-    if chance:
-        ax1.axhline(chance, color="gray", ls=":", lw=1)
-        ax1.text(ax1.get_xlim()[0], chance + 0.02, "chance", fontsize=8, color="gray")
-    ax1.set_xscale("log", base=2)
-    ax1.set_xlabel("Induction distance d = A₂ − A₁ (tokens)")
-    ax1.set_ylabel("Recall accuracy")
-    ax1.set_title("Behaviour: recall vs distance\n(hollow markers = beyond training length)")
-    ax1.legend(fontsize=8)
-    ax1.set_ylim(-0.05, 1.08)
-
-    # Right: accuracy vs predicted state survival, for architectures with SSM
-    for c, (arch, sw) in zip(colors, sweeps.items()):
-        recs = [r for r in sw["records"] if r.get("survival")]
+    def _line(ax, arch, key, getter=None):
+        recs = [r for r in sweeps[arch]["records"] if key in r]
         if not recs:
-            continue
+            return
         ds = [r["distance"] for r in recs]
-        best_surv = [
-            max(max(v["survival_empirical"]) for v in r["survival"].values())
-            for r in recs
-        ]
-        accs = [r["accuracy"] for r in recs]
-        ax2.plot(ds, best_surv, "s--", color=c, lw=1.4, alpha=0.8,
-                 label=f"{arch}: best-dim survival (empirical Δ)")
-        ax2.plot(ds, accs, "o-", color=c, lw=1.8, alpha=0.9,
-                 label=f"{arch}: accuracy")
-        fixed = [
-            max(max(v["survival_fixed_delta"]) for v in r["survival"].values())
-            for r in recs
-        ]
-        ax2.plot(ds, fixed, ":", color=c, lw=1.2, alpha=0.6,
-                 label=f"{arch}: survival (fixed Δ)")
+        ys = [getter(r) if getter else r[key] for r in recs]
+        c, m = ARCH_COLOR.get(arch, MUTED), ARCH_MARKER.get(arch, "o")
+        ax.plot(ds, ys, color=c, lw=1.8, label=_arch_label(arch))
+        for r, y in zip(recs, ys):
+            ax.plot(r["distance"], y, marker=m, ms=6, color=c, mew=1.6,
+                    mfc=c if r["in_distribution"] else SURFACE)
 
-    ax2.set_xscale("log", base=2)
-    ax2.set_xlabel("Induction distance d (tokens)")
-    ax2.set_ylabel("Accuracy / survival factor")
-    ax2.set_title("Prediction: does SSM state survival\n(exp(A·ΣΔ)) track the recall cliff?")
-    ax2.legend(fontsize=7)
-    ax2.set_ylim(-0.05, 1.08)
+    for arch in archs:
+        _line(ax1, arch, "accuracy")
+        _line(ax2, arch, "accuracy_no_memory")
+        _line(ax3, arch, "state_signal",
+              lambda r: max(v["signal_over_spread"] for v in r["state_signal"].values()))
 
-    fig.suptitle("Q3 — Memory limits of in-context recall", fontweight="bold", y=1.02)
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+    chance = next((sw.get("chance_accuracy") for sw in sweeps.values()), None)
+    trained_len = next((sw.get("trained_seq_len") for sw in sweeps.values()), None)
+    for ax in (ax1, ax2, ax3):
+        ax.set_xscale("log", base=2)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+        ax.set_xlabel("Induction distance A₁ → A₂ (tokens)")
+        if trained_len:
+            ax.axvline(trained_len, color=AXIS, lw=1)
+            ax.text(trained_len, 1.0, " training length", transform=ax.get_xaxis_transform(),
+                    fontsize=8, color=MUTED, va="top")
+    for ax in (ax1, ax2):
+        ax.set_ylim(-0.05, 1.08)
+        ax.set_ylabel("Recall accuracy")
+        if chance:
+            ax.axhline(chance, color=AXIS, lw=1)
+            # x in axes coordinates → safe on a log axis
+            ax.text(0.01, chance + 0.015, "chance", transform=ax.get_yaxis_transform(),
+                    fontsize=8, color=MUTED)
+
+    ax1.set_title("Recall vs distance")
+    handles, labels = ax1.get_legend_handles_labels()
+    ax3.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5))
+    ax2.set_title("…with SSM memory switched off")
+    ax3.set_title("Does the carried SSM state depend on B?")
+    ax3.set_ylabel("B-signal / between-sequence spread")
+    ax3.set_ylim(bottom=0)
+
+    fig.suptitle("Memory limits of in-context recall  "
+                 "(hollow marker = longer than any training sequence)",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Figure 5: Ablation bar chart
+# Analysis figures (one panel per architecture with a Mamba layer)
 # ---------------------------------------------------------------------------
+
+def _arch_panels(analyses: dict[str, dict], width: float, height: float):
+    archs = _sorted_archs(analyses.keys())
+    fig, axes = plt.subplots(1, len(archs), figsize=(width * len(archs), height),
+                             sharey=True, squeeze=False, constrained_layout=True)
+    return fig, axes[0], archs
+
+
+def plot_pathway_ablation(
+    analyses: dict[str, dict],     # arch → analysis dict (needs 'pathway')
+    chance: Optional[float] = None,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Accuracy with the SSM memory and / or the conv switched off, per Mamba
+    layer and for all Mamba layers together."""
+    fig, axes, archs = _arch_panels(analyses, 4.3, 3.8)
+    for ax, arch in zip(axes, archs):
+        res = analyses[arch]["pathway"]
+        layer_sets = []
+        for r in res:
+            if r["layers"] not in layer_sets:
+                layer_sets.append(r["layers"])
+        w = 0.8 / len(PATHWAY_ORDER)
+        for k, cond in enumerate(PATHWAY_ORDER):
+            ys = [next((r["accuracy"] for r in res
+                        if r["layers"] == ls and r["condition"] == cond), np.nan)
+                  for ls in layer_sets]
+            ax.bar(np.arange(len(layer_sets)) + (k - 1.5) * w, ys, w * 0.86,
+                   color=PATHWAY_COLOR[cond], label=PATHWAY_LABEL[cond])
+        if chance:
+            ax.axhline(chance, color=AXIS, lw=1)
+            ax.text(0.01, chance + 0.015, "chance", transform=ax.get_yaxis_transform(),
+                    fontsize=8, color=MUTED)
+        ax.set_xticks(range(len(layer_sets)))
+        ax.set_xticklabels(
+            [f"L{ls[0]} only" if len(ls) == 1 else "all Mamba\nlayers" for ls in layer_sets]
+        )
+        ax.set_ylim(0, 1.08)
+        ax.grid(axis="x", visible=False)
+        ax.set_title(_arch_label(arch))
+    axes[0].set_ylabel("Recall accuracy")
+    axes[-1].legend(loc="center left", bbox_to_anchor=(1.01, 0.5),
+                    title="Ablated in the named layer(s)")
+    fig.suptitle("Which cross-position pathway of the Mamba block does recall need?",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
+    return fig
+
+
+def plot_probe_decoding(
+    analyses: dict[str, dict],     # arch → analysis dict (needs 'probe')
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Cross-validated accuracy of decoding B's identity from the full SSM
+    state, at four read positions, one line per Mamba layer."""
+    fig, axes, archs = _arch_panels(analyses, 4.3, 3.8)
+    names = ["before A₁\n(control)", "at B", "midway", "just\nbefore A₂"]
+    for ax, arch in zip(axes, archs):
+        probes = analyses[arch]["probe"]
+        positions = sorted({p["position"] for p in probes})
+        layers = sorted({p["layer"] for p in probes})
+        xs = np.arange(len(positions))
+        for k, li in enumerate(layers):
+            acc = {p["position"]: p["accuracy"] for p in probes if p["layer"] == li}
+            ax.plot(xs, [acc.get(p, np.nan) for p in positions],
+                    color=SLOTS[k % len(SLOTS)], marker=MARKERS[k % len(MARKERS)],
+                    ls=LINE_STYLES[k % len(LINE_STYLES)], label=f"Mamba L{li}")
+        chance = probes[0]["chance"] if probes else None
+        if chance:
+            ax.axhline(chance, color=AXIS, lw=1)
+            ax.text(0.01, chance + 0.015, "chance", transform=ax.get_yaxis_transform(),
+                    fontsize=8, color=MUTED)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(names if len(positions) == len(names)
+                           else [f"pos {p}" for p in positions])
+        ax.set_xlabel("Position where the state is read")
+        ax.set_ylim(-0.03, 1.05)
+        ax.set_title(_arch_label(arch))
+        ax.legend(loc="upper left")
+    axes[0].set_ylabel("Decoding accuracy of B (64-way)")
+    fig.suptitle("Can B's identity be read out of the SSM state?",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
+    return fig
+
 
 def plot_ablation(
-    ablation_results: list,
+    analyses: dict[str, dict],     # arch → analysis dict (needs 'ablation')
     save_path: Optional[str] = None,
 ) -> plt.Figure:
-    if not ablation_results:
+    """Accuracy after silencing the two state dims that best separate B
+    ('top') vs two random dims (control)."""
+    fig, axes, archs = _arch_panels(analyses, 4.3, 3.8)
+    color = {"top": SLOTS[0], "random": MUTED}
+    for ax, arch in zip(axes, archs):
+        res = analyses[arch]["ablation"]
+        xs = np.arange(len(res))
+        ax.bar(xs, [r["val_accuracy"] for r in res], 0.6,
+               color=[color.get(r.get("kind", "top"), SLOTS[0]) for r in res])
+        if res:
+            base = res[0]["baseline_accuracy"]
+            ax.axhline(base, color=INK_2, lw=1)
+            ax.text(0.99, base + 0.015, "intact model", ha="right",
+                    transform=ax.get_yaxis_transform(), fontsize=8, color=INK_2)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(
+            [f"L{r['layer']}\n{r.get('kind', 'top')}\n{r['ablated_dims']}" for r in res],
+            fontsize=8,
+        )
+        ax.set_ylim(0, 1.12)
+        ax.grid(axis="x", visible=False)
+        ax.set_title(_arch_label(arch))
+    axes[0].set_ylabel("Recall accuracy after ablation")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=color["top"]),
+               plt.Rectangle((0, 0), 1, 1, color=color["random"])]
+    axes[-1].legend(handles, ["top-scoring state dims", "random state dims (control)"],
+                    loc="center left", bbox_to_anchor=(1.01, 0.5))
+    fig.suptitle("Does silencing two SSM state dims break recall?",
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
+    return fig
+
+
+def plot_timescales(
+    eigen: list[dict],      # EigenResult dicts for one architecture
+    arch: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Memory timescale τ of each state dim after training vs at
+    initialisation (same Δ). Points on the grey curve were not changed by
+    training."""
+    n = len(eigen)
+    if n == 0:
         return plt.figure()
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    labels = [f"L{r.layer}\ndims {r.ablated_dims}" for r in ablation_results]
-    baselines = [r.baseline_accuracy for r in ablation_results]
-    ablated = [r.val_accuracy for r in ablation_results]
-    x = np.arange(len(labels))
-    w = 0.35
-
-    ax.bar(x - w/2, baselines, w, label="Baseline", color="#2166ac", alpha=0.8)
-    ax.bar(x + w/2, ablated,   w, label="Ablated",  color="#fc8d59", alpha=0.9)
-
-    for xi, (b, a) in enumerate(zip(baselines, ablated)):
-        ax.text(xi + w/2, a + 0.01, f"−{b-a:.2f}", ha="center", fontsize=9, color="#d6604d")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Induction accuracy")
-    ax.set_ylim(0, 1.15)
-    ax.set_title("Accuracy drop when induction-critical SSM dims are ablated")
-    ax.legend()
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches="tight")
+    fig, axes = plt.subplots(1, n, figsize=(4.3 * n, 3.6), sharey=True,
+                             squeeze=False, constrained_layout=True)
+    for ax, er in zip(axes[0], eigen):
+        dims = np.arange(len(er["decay_timescales"]))
+        cap = 1e4      # display cap for τ = ∞
+        tr = np.minimum(np.array(er["decay_timescales"], dtype=float), cap)
+        init = np.minimum(np.array(er["init_timescales"], dtype=float), cap)
+        ax.plot(dims, init, color=MUTED, lw=1.2, marker="o", ms=5, mfc=SURFACE,
+                label="at initialisation")
+        ax.plot(dims, tr, color=SLOTS[0], lw=0, marker="o", ms=6, label="after training")
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+        ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        ax.set_xlabel("State dim (longest memory first)")
+        ax.set_title(f"Mamba L{er['layer']}  (mean Δ = {er['mean_delta']:.3f})")
+        ax.legend(loc="upper right")
+    axes[0][0].set_ylabel("Memory timescale τ (steps)")
+    title = "SSM memory timescales: did training change them?"
+    fig.suptitle(f"{_arch_label(arch)} — {title}" if arch else title,
+                 fontweight="bold", x=0.01, ha="left")
+    _save(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Convenience: generate all figures from saved results
+# Across seeds
 # ---------------------------------------------------------------------------
 
-class _Obj:
-    pass
+def plot_seed_training(
+    logs: dict[str, dict[str, list[dict]]],    # arch → seed_tag → train log
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """Validation accuracy vs training step: one line per (architecture,
+    seed). The spread between same-coloured lines is the seed-to-seed
+    variation in when induction appears."""
+    fig, ax = plt.subplots(figsize=(8.2, 4.0), constrained_layout=True)
+    for arch in _sorted_archs(logs.keys()):
+        for k, (tag, log) in enumerate(sorted(logs[arch].items())):
+            ax.plot([e["step"] for e in log], [e["val_acc"] for e in log],
+                    color=ARCH_COLOR.get(arch, MUTED), lw=1.5, alpha=0.85,
+                    marker=ARCH_MARKER.get(arch, "o"), ms=4,
+                    markevery=max(len(log) // 10, 1),
+                    label=f"{_arch_label(arch)} — {len(logs[arch])} seed(s)"
+                          if k == 0 else None)
+    ax.set_xscale("log")
+    ax.set_xlabel("Training step (log scale)")
+    ax.set_ylabel("Validation accuracy")
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
+    ax.set_title("When does induction appear?  One line per seed")
+    _save(fig, save_path)
+    return fig
 
 
-def _to(d):
-    o = _Obj()
-    o.__dict__.update(d)
-    return o
+def make_seed_summary(results_dir: str = "results", figures_dir: str = "figures") -> None:
+    """figure_seeds_training.png from every results/<arch>_<seed_tag>_train_log.json."""
+    rdir, fdir = Path(results_dir), Path(figures_dir)
+    fdir.mkdir(parents=True, exist_ok=True)
+    logs: dict[str, dict[str, list[dict]]] = {}
+    for pth in sorted(rdir.glob("*_train_log.json")):
+        run_name = pth.stem.replace("_train_log", "")
+        arch, _, tag = run_name.rpartition("_")
+        logs.setdefault(arch, {})[tag] = json.loads(pth.read_text())["log"]
+    if logs:
+        fig = plot_seed_training(logs, save_path=str(fdir / "figure_seeds_training.png"))
+        plt.close(fig)
+        print("Saved figure_seeds_training.png")
 
+
+# ---------------------------------------------------------------------------
+# Convenience: generate all per-seed figures from saved results
+# ---------------------------------------------------------------------------
 
 def make_all_figures(results_dir: str = "results", figures_dir: str = "figures") -> None:
     rdir = Path(results_dir)
     fdir = Path(figures_dir)
     fdir.mkdir(parents=True, exist_ok=True)
-    from patch import load_patch_results
+    from patch import CORRUPTIONS, load_patch_results
 
     # ── Q1: per-architecture patching heatmaps + cross-arch comparison ──
-    arch_grids = {}
     meta_path = rdir / "patch_meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    for pth in sorted(rdir.glob("patch_results_*.json")):
-        arch = pth.stem.replace("patch_results_", "")
-        pg = load_patch_results(pth)
-        arch_grids[arch] = pg
-        grids_np = {k: np.array(v, dtype=float) for k, v in pg.grids.items()}
-        first_A = meta.get("first_A_pos", pg.seq_len - 1 - meta.get("patch_dist", pg.seq_len - 16))
+    arch_pgs: dict[str, dict] = {}
+    for pth in sorted(rdir.glob("patch_*_*.json")):
+        arch, _, corr = pth.stem.replace("patch_", "", 1).rpartition("_")
+        if corr in CORRUPTIONS:
+            arch_pgs.setdefault(arch, {})[corr] = load_patch_results(pth)
+    for arch in _sorted_archs(arch_pgs.keys()):
+        pgs = {c: arch_pgs[arch][c] for c in CORRUPTIONS if c in arch_pgs[arch]}
+        arch_pgs[arch] = pgs
+        any_pg = next(iter(pgs.values()))
+        first_A = meta.get("first_A_pos", any_pg.seq_len - 1 - (any_pg.seq_len - 16))
         fig = plot_patching_heatmap(
-            grids_np,
-            layer_types=pg.layer_types,
-            first_A_pos=first_A,
-            first_B_pos=first_A + 1,
-            second_A_pos=pg.seq_len - 1,
+            pgs, arch, first_A_pos=first_A,
             save_path=str(fdir / f"figure_patching_heatmap_{arch}.png"),
         )
         plt.close(fig)
         print(f"Saved figure_patching_heatmap_{arch}.png")
 
-    if len(arch_grids) >= 2 and meta:
+    if arch_pgs and meta:
         fig = plot_arch_comparison(
-            arch_grids, first_B_pos=meta["first_A_pos"] + 1,
+            arch_pgs, first_A_pos=meta["first_A_pos"],
             save_path=str(fdir / "figure_arch_comparison.png"),
         )
         plt.close(fig)
@@ -501,7 +703,7 @@ def make_all_figures(results_dir: str = "results", figures_dir: str = "figures")
     for pth in sorted(rdir.glob("formation_*.json")):
         arch = pth.stem.replace("formation_", "")
         formation = json.loads(pth.read_text())
-        fig = plot_formation(formation,
+        fig = plot_formation(formation, arch=arch,
                              save_path=str(fdir / f"figure_formation_{arch}.png"))
         plt.close(fig)
         print(f"Saved figure_formation_{arch}.png")
@@ -509,42 +711,38 @@ def make_all_figures(results_dir: str = "results", figures_dir: str = "figures")
     # ── Q3: distance sweep ──
     sweeps = {}
     for pth in sorted(rdir.glob("distance_*.json")):
-        arch = pth.stem.replace("distance_", "")
-        sweeps[arch] = json.loads(pth.read_text())
+        sweeps[pth.stem.replace("distance_", "")] = json.loads(pth.read_text())
     if sweeps:
         fig = plot_distance(sweeps, save_path=str(fdir / "figure_distance.png"))
         plt.close(fig)
         print("Saved figure_distance.png")
 
-    # ── Eigenspectrum / probes / ablation from analysis.json ──
-    analysis_path = rdir / "analysis.json"
-    if analysis_path.exists():
-        data = json.loads(analysis_path.read_text())
-        eigen = [_to(r) for r in data.get("eigen", [])]
-        probes = [_to(r) for r in data.get("probe", [])]
-        ablations = [_to(r) for r in data.get("ablation", [])]
-
-        if eigen:
-            fig = plot_eigenspectrum(eigen, save_path=str(fdir / "figure_eigenspectrum.png"))
+    # ── Timescales / probes / ablations from analysis_<arch>.json ──
+    analyses = {}
+    for pth in sorted(rdir.glob("analysis_*.json")):
+        analyses[pth.stem.replace("analysis_", "")] = json.loads(pth.read_text())
+    if analyses:
+        chance = next((sw.get("chance_accuracy") for sw in sweeps.values()), None)
+        for name, plot, kwargs in [
+            ("figure_pathway_ablation.png", plot_pathway_ablation, {"chance": chance}),
+            ("figure_probe_decoding.png", plot_probe_decoding, {}),
+            ("figure_ablation.png", plot_ablation, {}),
+        ]:
+            fig = plot(analyses, save_path=str(fdir / name), **kwargs)
             plt.close(fig)
-            print("Saved figure_eigenspectrum.png")
-
-        if probes:
-            fig = plot_probe_decoding(probes,
-                                      save_path=str(fdir / "figure_probe_decoding.png"))
-            plt.close(fig)
-            print("Saved figure_probe_decoding.png")
-
-        if ablations:
-            fig = plot_ablation(ablations, save_path=str(fdir / "figure_ablation.png"))
-            plt.close(fig)
-            print("Saved figure_ablation.png")
+            print(f"Saved {name}")
+        for arch, data in analyses.items():
+            if data.get("eigen"):
+                fig = plot_timescales(data["eigen"], arch=arch,
+                                      save_path=str(fdir / f"figure_timescales_{arch}.png"))
+                plt.close(fig)
+                print(f"Saved figure_timescales_{arch}.png")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results_dir", default="results")
-    parser.add_argument("--figures_dir", default="figures")
+    parser.add_argument("--results_dir", default="results/s42")
+    parser.add_argument("--figures_dir", default="figures/s42")
     args = parser.parse_args()
     make_all_figures(args.results_dir, args.figures_dir)

@@ -11,8 +11,11 @@ Metric (from spec, corrected):
 
 Outputs:
     - results/<run_name>_train_log.json   — per-step metrics
-    - results/checkpoints/<run_name>_best.pt
-    - figures/figure_phase_transition.png  — phase transition curve
+    - results/checkpoints/<run_name>_final.pt  — last step (used by all analyses,
+                                                 so architectures are compared
+                                                 after the same amount of training)
+    - results/checkpoints/<run_name>_best.pt   — first step reaching the best val acc
+    - figures/figure_phase_transition_<run_name>.png  — phase transition curve
 """
 
 from __future__ import annotations
@@ -41,13 +44,12 @@ from model import HybridLM, HybridConfig
 def default_hybrid_config(
     vocab_size: int = 64,
     layer_pattern: str = "MAMA",
-    use_pos_emb: bool | None = None,
+    pos_encoding: str = "rope",
     max_seq_len: int = 512,
 ) -> HybridConfig:
-    # Pure-attention models need explicit position info to form a
-    # previous-token head; Mamba-containing models get it from the conv/scan.
-    if use_pos_emb is None:
-        use_pos_emb = ("M" not in layer_pattern.upper())
+    # Every architecture gets the same two block types and the same position
+    # signal (rotary, inside the attention layers), so a difference between
+    # architectures is a difference in layer order, not in block design.
     return HybridConfig(
         vocab_size=vocab_size,
         d_model=128,
@@ -55,8 +57,10 @@ def default_hybrid_config(
         d_conv=4,
         expand=2,
         n_heads=4,
+        mlp_ratio=2,
+        qk_bias=True,
         layer_pattern=layer_pattern,
-        use_pos_emb=use_pos_emb,
+        pos_encoding=pos_encoding,
         max_seq_len=max_seq_len,
     )
 
@@ -87,7 +91,7 @@ def train(
     n_train: int = 10_000,
     n_val: int = 1_000,
     batch_size: int = 64,
-    n_steps: int = 5_000,
+    n_steps: int = 20_000,
     lr: float = 3e-4,
     weight_decay: float = 0.01,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -298,7 +302,7 @@ def _plot_phase_transition(log: list[dict], figures_dir: str, run_name: str) -> 
         axes[2].set_title("Logit difference (paired foil metric)")
 
         fig.suptitle(
-            "Hybrid Mamba-Transformer — Induction Circuit Crystallization",
+            f"{run_name} — Induction Circuit Crystallization",
             fontweight="bold",
         )
         plt.tight_layout()
@@ -333,7 +337,8 @@ if __name__ == "__main__":
     from model import HybridLM, HybridConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_steps", type=int, default=5000)
+    parser.add_argument("--n_steps", type=int, default=20_000)
+    parser.add_argument("--layer_pattern", default="MAMA")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--vocab_size", type=int, default=64)
@@ -343,7 +348,8 @@ if __name__ == "__main__":
     parser.add_argument("--figures_dir", default="figures")
     args = parser.parse_args()
 
-    cfg = default_hybrid_config(vocab_size=args.vocab_size)
+    cfg = default_hybrid_config(vocab_size=args.vocab_size,
+                                layer_pattern=args.layer_pattern)
     model = HybridLM(cfg)
 
     results = train(
