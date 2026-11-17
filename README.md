@@ -51,9 +51,13 @@ figures/figure_seeds_training.png   accuracy vs step, every seed overlaid
 Every analysis loads the **final** checkpoint, so all architectures are
 analysed after the same number of training steps.
 
+Work already on disk is skipped, so running the same command again continues
+an interrupted run. `--force` redoes everything.
+
 ### On Kaggle
 
-In a notebook with a GPU accelerator:
+A GPU is required: on CPU a full run takes more than a day. In the notebook
+settings choose *Accelerator → GPU* and turn *Internet* on, then:
 
 ```python
 !git clone https://github.com/BertaCarner/interpretability-hybrid-model.git
@@ -62,8 +66,25 @@ In a notebook with a GPU accelerator:
 !zip -qr /kaggle/working/outputs.zip results figures -x "results/checkpoints/*"
 ```
 
+Check the first lines of the output before leaving it running:
+
+- `PHASE 1 — Training hybrid_ma (MAMA) | seed 42 | cuda` must say `cuda`,
+  not `cpu`;
+- after 50 steps each training run prints how many minutes it still needs.
+
 Use *Save Version → Save & Run All* so the session keeps running and
-`outputs.zip` is stored with the notebook version.
+`outputs.zip` is stored with the notebook version. A version that hits
+Kaggle's 12-hour limit is stopped before the zip step, so do not count on
+getting its output.
+
+If one session is not enough, run one architecture per notebook version by
+adding `--arch hybrid_ma` (then `hybrid_am`, `mamba`, `attn`) to the
+`run_all.py` line. Unzip the four `outputs.zip` files into the same folder
+and build the cross-architecture figures there, which needs no GPU:
+
+```bash
+python run_all.py --phase figures --seeds 42
+```
 
 ## How to read the main results
 

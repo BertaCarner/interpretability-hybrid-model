@@ -213,32 +213,37 @@ class SimpleMambaBlock(nn.Module):
         # Discretise via zero-order hold
         # dA[b,t,d,n] = exp( delta[b,t,d] * A[d,n] )
         dA = torch.exp(torch.einsum("bld,dn->bldn", delta, A))   # (B, L, Di, N)
-        # dB[b,t,d,n] = delta[b,t,d] * B_t[b,t,n]  (Euler approx)
-        dB = torch.einsum("bld,bln->bldn", delta, B_t)            # (B, L, Di, N)
+        # Write term dB_t ⊙ x_t, with dB[b,t,d,n] = delta[b,t,d] * B_t[b,t,n]
+        # (Euler approx)
+        dBx = torch.einsum("bld,bln->bldn", delta * x_act, B_t)   # (B, L, Di, N)
         if self.ablate_memory:
             dA = torch.zeros_like(dA)     # h_t = dB_t ⊙ x_t: nothing carried over
 
+        # Split into per-step views once. Indexing dA[:, t] inside the loop
+        # would make the backward pass allocate a full (B, L, Di, N) tensor at
+        # every step, which dominates training time.
+        dA_steps = dA.unbind(dim=1)                               # L × (B, Di, N)
+        dBx_steps = dBx.unbind(dim=1)                             # L × (B, Di, N)
+        patch_steps: set[int] = set()
+        if h_override is not None and h_override_mask is not None:
+            patch_steps = set(h_override_mask.nonzero().flatten().tolist())
+
         h = x_act.new_zeros(B, Di, N)                             # (B, Di, N)
         h_list: list[torch.Tensor] = []
-        y_list: list[torch.Tensor] = []
 
         for t in range(L):
             # Recurrence: h_t = dA_t ⊙ h_{t-1} + dB_t ⊙ x_t
-            h = dA[:, t] * h + dB[:, t] * x_act[:, t].unsqueeze(-1)  # (B, Di, N)
+            h = torch.addcmul(dBx_steps[t], dA_steps[t], h)       # (B, Di, N)
 
             # Patch h_t with clean activation if requested
-            if h_override is not None and h_override_mask is not None:
-                if h_override_mask[t]:
-                    h = h_override[:, t]                           # (B, Di, N)
+            if t in patch_steps:
+                h = h_override[:, t]                               # (B, Di, N)
 
             h_list.append(h)                                       # store (B, Di, N)
 
-            # Output: y_t = C_t · h_t + D · x_t
-            y_t = torch.einsum("bdn,bn->bd", h, C_t[:, t])        # (B, Di)
-            y_list.append(y_t)
-
         h_cache = torch.stack(h_list, dim=1)                       # (B, L, Di, N)
-        y = torch.stack(y_list, dim=1)                             # (B, L, Di)
+        # Output: y_t = C_t · h_t  (the D · x_t skip is added by the caller)
+        y = torch.einsum("bldn,bln->bld", h_cache, C_t)            # (B, L, Di)
         return y, h_cache
 
     # ------------------------------------------------------------------

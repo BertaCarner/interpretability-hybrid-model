@@ -26,6 +26,12 @@ Every output is tagged by seed (results/s42/…, figures/s42/…), so seeds neve
 overwrite each other; figures/figure_seeds_training.png overlays all seeds.
 All analyses load the FINAL checkpoint, so every architecture is analysed
 after the same number of training steps.
+
+Resuming:
+    Work that is already on disk is skipped: an architecture whose final
+    checkpoint exists is not retrained, and an analysis whose output is newer
+    than that checkpoint is not recomputed. Re-running the same command
+    therefore continues an interrupted run. --force redoes everything.
 """
 
 from __future__ import annotations
@@ -56,6 +62,8 @@ ARCHS = {
     "attn":      "AAAA",
 }
 
+FORCE       = False          # --force: redo work that is already on disk
+
 RESULTS = Path("results")
 FIGURES = Path("figures")
 CKPTS   = RESULTS / "checkpoints"
@@ -78,6 +86,32 @@ def _seed_dirs(seed_tag: str) -> tuple[Path, Path]:
     rdir.mkdir(parents=True, exist_ok=True)
     fdir.mkdir(parents=True, exist_ok=True)
     return rdir, fdir
+
+
+def _final_ckpt(arch: str, seed_tag: str) -> Path:
+    return CKPTS / f"{_run_name(arch, seed_tag)}_final.pt"
+
+
+def _already_trained(arch: str, seed_tag: str) -> bool:
+    """A finished training run of the requested length is on disk."""
+    log = RESULTS / f"{_run_name(arch, seed_tag)}_train_log.json"
+    if FORCE or not (_final_ckpt(arch, seed_tag).exists() and log.exists()):
+        return False
+    return json.loads(log.read_text()).get("n_steps") == N_STEPS
+
+
+def _up_to_date(arch: str, seed_tag: str, *outputs: Path) -> bool:
+    """Every output exists and is at least as new as the final checkpoint,
+    i.e. it was computed from the model that is on disk now."""
+    ckpt = _final_ckpt(arch, seed_tag)
+    if FORCE or not ckpt.exists():
+        return False
+    done = all(p.exists() and p.stat().st_mtime >= ckpt.stat().st_mtime
+               for p in outputs)
+    if done:
+        print(f"{arch}: {', '.join(p.name for p in outputs)} already computed "
+              "— skipping (use --force to redo)")
+    return done
 
 
 def _load_model(arch: str, seed_tag: str, which: str = "final"):
@@ -107,6 +141,10 @@ def phase_train(seed: int, seed_tag: str) -> None:
         print("=" * 60)
         print(f"PHASE 1 — Training {arch} ({pattern}) | seed {seed} | {DEVICE}")
         print("=" * 60)
+        if _already_trained(arch, seed_tag):
+            print(f"{arch}: found {_final_ckpt(arch, seed_tag)} ({N_STEPS:,} steps) "
+                  "— skipping (use --force to retrain)\n")
+            continue
 
         cfg = default_hybrid_config(vocab_size=VOCAB_SIZE, layer_pattern=pattern)
         model = HybridLM(cfg)
@@ -153,6 +191,9 @@ def phase_patch(seed: int, seed_tag: str) -> None:
         print("=" * 60)
         print(f"PHASE 2 — Patching {arch}")
         print("=" * 60)
+        if _up_to_date(arch, seed_tag, *(rdir / f"patch_{arch}_{c}.json"
+                                         for c in CORRUPTIONS)):
+            continue
         model, _ = _load_model(arch, seed_tag)
 
         # Sanity gate: don't interpret a circuit that doesn't exist
@@ -166,7 +207,10 @@ def phase_patch(seed: int, seed_tag: str) -> None:
 
         for corruption in CORRUPTIONS:
             print(f"-- corrupt {corruption} --")
+            # One chunk: the scan needs one forward pass per (layer,
+            # component, position) per chunk, whatever the chunk size.
             pg = run_patch_experiment(model, ds, n_examples=N_EXAMPLES,
+                                      batch_size=N_EXAMPLES,
                                       device=DEVICE, verbose=True,
                                       corruption=corruption)
             save_patch_results(pg, rdir / f"patch_{arch}_{corruption}.json")
@@ -196,6 +240,8 @@ def phase_formation(seed: int, seed_tag: str) -> None:
         print("=" * 60)
         print(f"PHASE 3 — Formation {arch}")
         print("=" * 60)
+        if _up_to_date(arch, seed_tag, rdir / f"formation_{arch}.json"):
+            continue
         cfg = default_hybrid_config(vocab_size=VOCAB_SIZE, layer_pattern=ARCHS[arch])
         try:
             run_formation_analysis(
@@ -222,6 +268,8 @@ def phase_distance(seed: int, seed_tag: str) -> None:
         print("=" * 60)
         print(f"PHASE 4 — Distance sweep {arch}")
         print("=" * 60)
+        if _up_to_date(arch, seed_tag, rdir / f"distance_{arch}.json"):
+            continue
         model, _ = _load_model(arch, seed_tag)
         run_distance_sweep(
             model,
@@ -263,6 +311,8 @@ def phase_analyze(seed: int, seed_tag: str) -> None:
         print("=" * 60)
         print(f"PHASE 5 — Mechanistic analysis ({arch})")
         print("=" * 60)
+        if _up_to_date(arch, seed_tag, rdir / f"analysis_{arch}.json"):
+            continue
         model, cfg = _load_model(arch, seed_tag)
 
         print("1/4  Timescales with empirical Δ (vs initialisation)...")
@@ -339,12 +389,21 @@ if __name__ == "__main__":
                         help="run a single architecture (cheap iteration)")
     parser.add_argument("--n_steps", type=int, default=None,
                         help="override N_STEPS for this invocation")
+    parser.add_argument("--force", action="store_true",
+                        help="redo training / analyses that are already on disk")
     args = parser.parse_args()
 
     if args.arch != "all":
         ARCHS = {args.arch: ARCHS[args.arch]}
     if args.n_steps is not None:
         N_STEPS = args.n_steps
+    FORCE = args.force
+
+    if DEVICE == "cpu" and args.phase in ("train", "all"):
+        print("WARNING: no GPU found, running on CPU. A Mamba training step "
+              "takes seconds on CPU, so a full run takes more than a day. On "
+              "Kaggle: Settings → Accelerator → GPU, then restart the session.",
+              flush=True)
 
     phases = {
         "train": phase_train, "patch": phase_patch, "formation": phase_formation,

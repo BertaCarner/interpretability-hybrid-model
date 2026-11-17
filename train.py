@@ -130,7 +130,9 @@ def train(
     val_ds = InductionDataset(n_val, seq_len=seq_len, vocab_size=vocab_size,
                               seed=seed + 1, min_dist=min_dist, max_dist=max_dist)
     train_loader = make_loader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = make_loader(val_ds, batch_size=batch_size, shuffle=False)
+    # Validation is forward-only and the Mamba scan costs per time step, not
+    # per example, so a few large batches are much cheaper than many small ones.
+    val_loader = make_loader(val_ds, batch_size=max(batch_size, 250), shuffle=False)
 
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -243,6 +245,10 @@ def train(
                 f"LD {ld_train:+.3f} | val_acc {val_acc:.3f} | "
                 f"val_LD {val_ld:+.3f} | {entry['elapsed_s']:.1f}s"
             )
+            if step == log_every and n_steps > step:
+                eta_min = entry["elapsed_s"] / step * (n_steps - step) / 60
+                print(f"  (at this speed the remaining {n_steps - step:,} steps "
+                      f"take about {eta_min:.0f} min)", flush=True)
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc

@@ -136,7 +136,8 @@ def run_formation_analysis(
         patch = {}
         for corruption in CORRUPTIONS:
             pg = run_patch_experiment(
-                model, eval_ds, n_examples=n_patch, device=device,
+                model, eval_ds, n_examples=n_patch, batch_size=n_patch,
+                device=device,
                 verbose=False, positions=list(key_positions.values()),
                 corruption=corruption,
             )
